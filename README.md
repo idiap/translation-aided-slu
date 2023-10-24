@@ -1,4 +1,4 @@
-This it the reference code for the paper [The Interpreter Understands Your Meaning: 
+This is the reference code for the paper [The Interpreter Understands Your Meaning: 
 End-to-end Spoken Language Understanding Aided by Speech Translation](https://arxiv.org/abs/2305.09652), accepted by Findings of EMNLP 2023. Relevant assets including datasets will be released soon.
 
 # Dataset preparation
