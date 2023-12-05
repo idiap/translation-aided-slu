@@ -1,5 +1,5 @@
 This is the reference code for the paper [The Interpreter Understands Your Meaning: 
-End-to-end Spoken Language Understanding Aided by Speech Translation](https://arxiv.org/abs/2305.09652), accepted by Findings of EMNLP 2023. Relevant assets including datasets will be released soon.
+End-to-end Spoken Language Understanding Aided by Speech Translation](https://arxiv.org/abs/2305.09652), accepted by the Findings of EMNLP 2023. Pretrained models are available [here](https://huggingface.co/mutiann/translation-aided-slu) on Huggingface. Relevant assets including datasets will be released soon.
 
 # Dataset preparation
 Please run the corresponding scripts in corpora/ to prepare the datasets used, with the 
