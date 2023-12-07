@@ -1,5 +1,7 @@
 This is the reference code for the paper [The Interpreter Understands Your Meaning: 
-End-to-end Spoken Language Understanding Aided by Speech Translation](https://arxiv.org/abs/2305.09652), accepted by the Findings of EMNLP 2023. Pretrained models are available [here](https://huggingface.co/mutiann/translation-aided-slu) on Huggingface. Relevant assets including datasets will be released soon.
+End-to-end Spoken Language Understanding Aided by Speech Translation](https://arxiv.org/abs/2305.09652), accepted by the Findings of EMNLP 2023. Pretrained models are available [here](https://huggingface.co/mutiann/translation-aided-slu) on Huggingface.
+
+The datasets developed in the paper have been also released. See [SLURP-Fr/Es (synthetic portion)](https://zenodo.org/records/10279712), [SLURP-Fr (real portion)](https://zenodo.org/records/10280827), and [Spoken Gigaword](https://zenodo.org/records/10281475).
 
 # Dataset preparation
 Please run the corresponding scripts in corpora/ to prepare the datasets used, with the 
