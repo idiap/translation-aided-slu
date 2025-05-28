@@ -14,6 +14,7 @@ from torch import nn
 from torch.nn import functional as F
 from models.build import build_asr_model, build_text_decoder, build_classifier, build_infergen, \
     Adaptor, AdversarialClassifier
+import transformers
 from transformers.utils import ModelOutput
 import logging
 import traceback as tb
@@ -26,7 +27,9 @@ class Model(nn.Module):
         if hparams.use_decoder:
             self.decoder = build_text_decoder(hparams)
         if hparams.use_decoder or hparams.use_classifier:
-            self.adaptor = Adaptor(hparams, self.asr_model.config.hidden_size, hparams.adaptor_output_dim)
+            self.adaptor = Adaptor(hparams, self.asr_model.config.hidden_size, hparams.adaptor_output_dim,
+                                   None if not hparams.adaptor_layer_mixer
+                                   else (self.asr_model.config.num_hidden_layers + 1))
         if hparams.use_classifier:
             if hparams.use_infergen:
                 self.infergen = build_infergen(
@@ -43,13 +46,16 @@ class Model(nn.Module):
 
     def forward(self, inputs, input_masks=None, labels=None, decoder_labels=None, decoder_label_masks=None,
                 src_lang=None, tgt_lang=None, generate=False, **kwargs):
-        outputs = self.asr_model(input_values=inputs, attention_mask=input_masks,
-                                 labels=labels if self.hparams.ctc_weight > 0 else None,
-                                 output_hidden_states=True, return_dict=True)
-        infer_classifier = self.hparams.use_classifier and kwargs.get('type', 's2s') == 'cls'
+        asr_args = {}
+        if self.hparams.ctc_weight > 0:
+            asr_args['labels'] = labels
+        outputs = self.asr_model(inputs, attention_mask=input_masks,
+                                 output_hidden_states=True, return_dict=True,
+                                 **asr_args)
+        infer_classifier = self.hparams.use_classifier and kwargs.get('type', 's2s') in ['cls', 'rgs']
         if kwargs.get('type', 's2s') == 's2s' and self.hparams.use_decoder:
             infer_decoder = 'decoder'
-        elif kwargs.get('type', 's2s') == 'cls':
+        elif kwargs.get('type', 's2s') in ['cls', 'rgs']:
             if self.hparams.classifier_position == 'decoder_decoder':
                 infer_decoder = 'decoder'
             elif self.hparams.classifier_position == 'decoder_encoder':
@@ -61,11 +67,24 @@ class Model(nn.Module):
             infer_decoder = False
         if infer_decoder in ['decoder', 'encoder'] and not self.hparams.use_decoder:
             raise ValueError('use_decoder must be True when using decoder')
-        mask = self.asr_model._get_feature_vector_attention_mask(
-            outputs.get('logits', outputs['hidden_states'][-1]).shape[1], input_masks)
+        if hasattr(self.asr_model, '_get_feature_vector_attention_mask'):
+            mask = self.asr_model._get_feature_vector_attention_mask(
+                outputs.get('logits', outputs['hidden_states'][-1]).shape[1], input_masks)
+        elif isinstance(self.asr_model, transformers.WhisperPreTrainedModel):
+            lengths = input_masks.sum(-1)
+            lengths = (lengths + 1) // 2
+            max_length = lengths.max()
+            mask = torch.arange(max_length, device=lengths.device).expand(len(lengths), max_length) < lengths.unsqueeze(1)
+            outputs['hidden_states'] = outputs['hidden_states'][:-1] + (outputs['hidden_states'][-1][:, :max_length],)
+        else:
+            mask = input_masks
         outputs['encoder_mask'] = mask
         if infer_decoder:
-            hidden = self.adaptor(outputs['hidden_states'][-1], src_lang=src_lang, tgt_lang=tgt_lang)
+            if self.hparams.adaptor_layer_mixer:
+                adaptor_features = outputs['hidden_states']
+            else:
+                adaptor_features = outputs['hidden_states'][-1]
+            hidden = self.adaptor(adaptor_features, src_lang=src_lang, tgt_lang=tgt_lang)
             mask = self.adaptor.transform_attention_mask(mask)
             outputs['adaptor_outputs'] = hidden
             outputs['decoder_mask'] = mask
@@ -79,7 +98,7 @@ class Model(nn.Module):
                                                         output_hidden_states=True, return_dict=True)
                 outputs['decoder_encoder_outputs'] = encoder_outputs
             else:
-                encoder_outputs = hidden
+                encoder_outputs = ModelOutput(last_hidden_state=hidden)
 
         if infer_decoder == 'decoder':
             if generate:
@@ -93,6 +112,7 @@ class Model(nn.Module):
                 else:
                     gen_kwargs['encoder_outputs'] = ModelOutput(last_hidden_state=hidden)
                 decoder_outputs = self.decoder.generate(output_attentions=True, attention_mask=mask,
+                                                        # num_return_sequences=5, output_scores=True, return_dict_in_generate=True,
                                                         **gen_kwargs)
             else:
                 decoder_outputs = self.decoder(attention_mask=mask,
@@ -139,11 +159,27 @@ class Model(nn.Module):
                         outputs['classifier_outputs']['logits'] = \
                             outputs['classifier_outputs']['logits'].transpose(0, 1)
                 else:
-                    outputs['classifier_outputs'] = self.classifier(classifier_feature, classifier_mask)
+                    outputs['classifier_outputs'] = self.classifier(classifier_feature, classifier_mask,
+                                                                    prompts=kwargs.get('input_prompts', None))
 
         return outputs
 
+    # def convert_positions(self, positions, input_shape, target='adaptor'):
+    #     mask = torch.zeros(input_shape)
+    #     for i in range(len(positions)):
+    #         if positions[i] >= 0:
+    #             mask[i, positions[i]] = 1
+    #     mask = self.asr_model._get_feature_vector_attention_mask(
+    #         input_shape[1], mask)
+    #     if target == 'encoder':
+    #         return
+    #     mask = self.adaptor.transform_attention_mask(mask)
+    #     assert torch.all(mask.sum(dim=1) == 1)
+    #     return torch.argmax(mask, dim=1)
+    #
+
 def learning_rate_schedule(global_step, hp):
+    global_step += hp.lr_step_shift
     if hp.reset_period > 0:
         n_reset_times = global_step // hp.reset_period
         n_reset_times = min(n_reset_times, hp.reset_times)
@@ -161,6 +197,13 @@ def learning_rate_schedule(global_step, hp):
             return 1 - (global_step - hp.warmup_steps - hp.plateau_steps) * decay_factor / hp.max_lr
         elif hp.decay_type == 'inv_sqrt':
             decay_factor = torch.sqrt(torch.tensor((hp.warmup_steps + hp.plateau_steps) / global_step))
+            return decay_factor
+        elif hp.decay_type == 'inv_sqrt_v2':
+            decay_factor = torch.sqrt(torch.tensor(1.0 / (global_step - hp.warmup_steps - hp.plateau_steps)))
+            return decay_factor
+        elif hp.decay_type == 'inv_power':
+            coeff = torch.log(torch.tensor(hp.max_lr / hp.final_lr)) / torch.log(torch.tensor(hp.decay_steps))
+            decay_factor = 1.0 / torch.pow(torch.tensor(global_step - hp.warmup_steps - hp.plateau_steps), coeff)
             return decay_factor
         else:
             raise ValueError('Unknown decay type: %s' % hp.decay_type)
@@ -276,6 +319,21 @@ def compute_loss(batch, outputs, model, hp, global_step=None):
         result['classifier_losses'] = classifier_losses
         result['classifier_loss'] = classifier_loss
 
+    if batch['type'] == 'rgs' and isinstance(outputs.get('classifier_outputs'), dict):
+        logits = outputs['classifier_outputs']['logits']
+        regressor_loss = 0.
+        regressor_losses = []
+        for i in range(len(logits)):
+            cls_loss = F.mse_loss(logits[i].reshape([-1]), batch['labels'][:, i], reduction='none')
+            cls_loss = torch.where(batch['labels'][:, i] == -100, 0, cls_loss)
+            regressor_loss += cls_loss.sum()
+            regressor_losses.append(cls_loss)
+        regressor_losses = torch.stack(regressor_losses)
+        regressor_loss = regressor_loss / len(logits)
+        loss = loss + regressor_loss * hp.classifier_weight
+        result['classifier_losses'] = regressor_losses
+        result['classifier_loss'] = regressor_loss
+
     if 'language_adversarial_outputs' in outputs:
         result['language_adversarial_losses'] = F.cross_entropy(outputs['language_adversarial_outputs'],
                                                               batch['src_lang'], reduction='none')
@@ -290,6 +348,7 @@ def compute_loss(batch, outputs, model, hp, global_step=None):
     result.update({'batch_size': batch_size, 'n_frames': n_frames})
     return result
 
+permanent_freeze = None
 def freeze_module(model, prefix=None, name_fn=None, frozen=True, keep_encoder_frozen=True):
     if hasattr(model, 'module'):
         model = model.module
@@ -314,6 +373,15 @@ def freeze_module(model, prefix=None, name_fn=None, frozen=True, keep_encoder_fr
             model.asr_model.freeze_feature_encoder()
     except:
         tb.print_exc()
+    if permanent_freeze is not None:
+        pfn = []
+        for name, param in model.named_parameters():
+            if name in permanent_freeze or 'module.' + name in permanent_freeze:
+                param.requires_grad = False
+                pfn.append(name)
+        if pfn:
+            logging.info("Permanent freeze %d parameters:" % len(pfn))
+            logging.info(", ".join(pfn))
 
 def init_module(model, prefix):
     if hasattr(model, 'module'):
@@ -321,11 +389,22 @@ def init_module(model, prefix):
     base_module = [('asr_model', model.asr_model)]
     if model.hparams.use_decoder:
         base_module.append(('decoder', model.decoder))
+    if hasattr(model, 'adaptor'):
+        base_module.append(('adaptor', model.adaptor))
+    if hasattr(model, 'classifier'):
+        base_module.append(('classifier', model.classifier))
+    init_modules = []
     for bn, m in base_module:
         for name, module in m.named_modules():
             name = bn + '.' + name
-            if name.startswith(prefix):
-                m._init_weights(module)
+            if name.startswith(prefix) and hasattr(module, '_init_weights'):
+                if any([name.startswith(p) for p in init_modules]):
+                    continue
+                module._init_weights(module)
+                init_modules.append(name)
+    if init_modules:
+        logging.info("Init %d modules:" % len(init_modules))
+        logging.info(", ".join(init_modules))
 
 def regularize_l2_sp(model, reference, weight):
     if hasattr(model, 'module'):

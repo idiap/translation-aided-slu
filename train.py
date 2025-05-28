@@ -5,7 +5,6 @@
 #
 # SPDX-License-Identifier: MIT
 #
-
 import gc
 import pickle
 from collections import defaultdict, Counter
@@ -31,8 +30,6 @@ from functools import partial
 import sys
 import faulthandler, signal
 from datetime import timedelta
-from infer import infer_batches
-
 def main(args):
     model_dir = args.model_dir
     logdir = args.log_dir if args.log_dir is not None else model_dir
@@ -102,9 +99,18 @@ def main(args):
     else:
         best_metrics = {'history': defaultdict(list)}
 
+    # A tricky way to forcifully disable GPU; otherwise nn.DataParallel will try to use GPU if available
+    if torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory / 1e9 < 8:
+        torch.cuda.is_available = lambda: False
 
-    if not torch.cuda.is_available():
-        map_location = lambda _, __:  _.cpu()
+    if torch.cuda.is_available():
+        device = 'cuda'
+        logging.info("Using %d GPUs, memory size: %.1f GB" %
+                     (torch.cuda.device_count(), torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)))
+    else:
+        device = 'cpu'
+        map_location = lambda _, __: _.cpu()
+        logging.info("Using CPU")
 
     if rank == 0:
         values = hp.values()
@@ -128,26 +134,28 @@ def main(args):
 
     feeder, feeder_eval, processor = get_feeder(args, hp, rank, world_size, get_eval=rank == 0)
 
-    logging.info("Using %d GPUs" % torch.cuda.device_count())
     m = model.Model(hp)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     m.to(device)
     if args.ddp:
         example_param = list(m.parameters())[5]
         logging.info("Model on %s" % str(example_param.device))
         m = nn.parallel.DistributedDataParallel(m, device_ids=[local_rank], output_device=local_rank)
-    else:
+    elif device == 'cuda':
         m = nn.DataParallel(m)
+    else:
+        m = nn.DataParallel(m, device_ids=['cpu'])
 
     wd, nwd = [], []
     for name, param in m.named_parameters():
         if model.is_weight_decayed(name):
-            wd.append(param)
+            wd.append((name, param))
         else:
-            nwd.append(param)
+            nwd.append((name, param))
 
-    optim = torch.optim.AdamW([{'params': wd, 'weight_decay': hp.reg_weight}, {'params': nwd, 'weight_decay': 0.}],
-                              lr=hp.max_lr, eps=hp.adam_eps, betas=(0.9, 0.999))
+    optim = torch.optim.AdamW([
+        {'params': [p[1] for p in wd], 'param_names': [p[0] for p in wd], 'weight_decay': hp.reg_weight},
+        {'params': [p[1] for p in nwd], 'param_names': [p[0] for p in nwd], 'weight_decay': 0.}],
+        lr=hp.max_lr, eps=hp.adam_eps, betas=(0.9, 0.999))
 
     # optim = torch.optim.AdamW(m.parameters(),
     #                           lr=hp.max_lr, eps=hp.adam_eps, betas=(0.9, 0.999), weight_decay=hp.reg_weight)
@@ -192,14 +200,18 @@ def main(args):
 
     m.train()
 
+    logging.info(str(m))
+
     time_window = infolog.ValueWindow(100)
     loss_window = infolog.ValueWindow(100)
     recent_fails = infolog.ValueWindow(10)
     summary_windows = [('time', time_window), ('loss', loss_window)]
 
+    if args.permanent_freeze:
+        pf = json.load(open(args.permanent_freeze))
+        model.permanent_freeze = pf
     def is_lna(name):
-        return 'attention' in name or 'layer_norm' in name or '_attn' in name \
-               or 'embed_positions' in name or 'layernorm' in name or '.adaptor' in name
+        return ".feed_forward." not in name
 
     if global_step < hp.freeze_steps:
         model.freeze_module(m, hp.freeze_module, keep_encoder_frozen=hp.freeze_feature_encoder)
@@ -217,7 +229,8 @@ def main(args):
             logging.info("%s %s %s" % (name, param.shape, param.requires_grad))
             if param.requires_grad:
                 n_param += param.numel()
-        logging.info("Total number of trainable parameters: %d" % n_param)
+        logging.info("Total number of trainable parameters: %.1f M" % (n_param / 1e6))
+        logging.info("Total %d variables, %d buffers" % (len(list(m.parameters())), len(list(m.buffers()))))
 
     model.init_module(m, hp.reinit_module)
 
@@ -235,8 +248,8 @@ def main(args):
     def signal_handler(sig, frame):
         if not args.no_write:
             logging.info("Got signal %d, saving and exiting" % sig)
-            step = feeder.global_step
-            checkpoint.save_model(os.path.join(model_dir, 'model.ckpt-%d' % step), m, optim, sched)
+            checkpoint.save_model(model_dir, m, optim, sched, global_step)
+            logging.info("Save checkpoint to " + model_dir)
             torch.save(feeder.state_dict(), os.path.join(logdir, 'feeder_%d_%d.pth' % (global_step, rank)))
         sys.exit(0)
 
@@ -307,8 +320,8 @@ def main(args):
                                 losses[key].item() if torch.is_tensor(losses[key]) else losses[key]
                     src_langs.extend(batch['src_lang'].detach().cpu().numpy().tolist())
                 except Exception as e:
-                    logging.error("Failed due to %s, input shape: %s, target shape: %s" %
-                                  (type(e).__name__, str(batch['inputs'].shape), str(batch['labels'].shape)))
+                    logging.error("Failed due to %s, input shape: %s, target shape: %s (%s)" %
+                                  (type(e).__name__, str(batch['inputs'].shape), str(batch['labels'].shape), batch_type))
                     traceback.print_exc()
                     if len(recent_fails._values) == 10 and recent_fails._values[0] > global_step - 20:
                         logging.error("Too many failures, exiting")
@@ -356,7 +369,7 @@ def main(args):
 
         if global_step == hp.freeze_steps:
             if hp.use_lna:
-                model.freeze_module(m, name_fn=is_lna, frozen=False, keep_encoder_frozen=hp.freeze_feature_encoder)
+                model.freeze_module(m, '', frozen=False, keep_encoder_frozen=hp.freeze_feature_encoder)
             else:
                 model.freeze_module(m, hp.freeze_module, frozen=False, keep_encoder_frozen=hp.freeze_feature_encoder)
 
@@ -399,12 +412,21 @@ def main(args):
                 for name, window in summary_windows:
                     writer.add_scalar('average/' + name, window.average, global_step=global_step)
                 writer.add_scalar('memory/cuda', torch.cuda.memory_allocated(), global_step=global_step)
+
+                if hp.adaptor_layer_mixer:
+                    actual_m = m if not hasattr(m, 'module') else m.module
+                    actual_m = actual_m.state_dict()
+                    name = 'adaptor.layermix'
+                    param = actual_m[name].reshape(-1)
+                    for dim_i in range(param.shape[0]):
+                        writer.add_scalar('param/' + name + '/%d' % dim_i, param[dim_i], global_step=global_step)
                 writer.flush()
 
             if (eval_steps and global_step in eval_steps) or \
                     (eval_steps is None and
                      ((global_step % args.checkpoint_interval == 0) or
                       (global_step % args.eval_interval == 0))):
+                from infer import infer_batches
                 eval_path = os.path.join(logdir, 'eval_%d' % (global_step))
                 batches = feeder_eval.fetch_data()
 
@@ -453,6 +475,7 @@ if __name__ == '__main__':
                         help="Metadata file for training, use metadata.train.txt under data-dir when not given")
     parser.add_argument('--eval_meta', type=str, default=None,
                         help="Metadata file for eval, use metadata.eval.txt under data-dir when not given")
+    parser.add_argument('--category_vocab_path', type=str, default=None, help="Path to categories.json")
     parser.add_argument('--eval_steps', type=str, default=None,
                         help="Steps of checkpoints to run eval on. Run on all steps when not specified")
     parser.add_argument('--src_lang', type=str, default='',
@@ -477,6 +500,7 @@ if __name__ == '__main__':
     parser.add_argument("--reset_training", action='store_true', default=False)
     parser.add_argument("--max_epoch", type=int, default=0)
     parser.add_argument("--disable_auto_save",  action='store_true', default=False)
+    parser.add_argument("--permanent_freeze",  type=str, default=None)
 
     args, unparsed = parser.parse_known_args()
     print('unparsed:', unparsed)
@@ -511,6 +535,7 @@ if __name__ == '__main__':
                 short_retry_cnt += 1
             else:
                 short_retry_cnt = 0
+            time.sleep(10)
             if short_retry_cnt == 3:
                 print("Too many short retries, abort")
                 break

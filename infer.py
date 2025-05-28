@@ -18,13 +18,14 @@ import datetime
 import sys
 from utils import infolog, checkpoint
 from models import model, build
-from dataloader import get_feeder
+from dataloader import get_feeder, pick_eval_samples
 from hyperparams import hparams as hp
 from utils.languages import id_to_lang
 from functools import partial
 from collections import defaultdict
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
+import traceback as tb
 
 metrics = None
 metrics_type = {}
@@ -44,9 +45,10 @@ def load_metrics():
         return results['bleu']
 
     all_metrics = {'wer': jiwer.wer, 'cer': jiwer.cer, 'bleu': compute_bleu}
+    eval_metrics = hp.eval_metrics.split(':')
     metrics = dict([(k, all_metrics[k]) for k in hp.eval_metrics if k in all_metrics])
 
-    if 'rouge' in hp.eval_metrics:
+    if 'rouge' in eval_metrics:
         for ch in '12L':
             metrics['rouge' + ch] = partial(compute_rouge, key='rouge' + ch)
             metrics_type['rouge' + ch] = 'sum'
@@ -60,16 +62,107 @@ def load_metrics():
         if ex_metric in metrics:
             metrics['norm_' + ex_metric] = partial(normalized_error_rate, fn=metrics[ex_metric])
 
-    def accuracy(labels, preds, component=None):
+    def select_filter_label_pred(labels, preds, component):
         if component is not None:
-            return np.mean([l[component] == p[component] for l, p in zip(labels, preds)])
-        return np.mean([tuple(l) == tuple(p) for l, p in zip(labels, preds)])
+            labels = [(l[component],) for l in labels]
+            preds = [(p[component],) for p in preds]
+        else:
+            labels = [tuple(l) for l in labels]
+            preds = [tuple(p) for p in preds]
+        lp = [(l, p) for l, p in zip(labels, preds) if not all([t == -100 for t in l])]
+        if not lp:
+            return [], []
+        labels, preds = list(zip(*lp))
+        return labels, preds
+    def accuracy(labels, preds, component=None):
+        labels, preds = select_filter_label_pred(labels, preds, component)
+        if not labels:
+            return 1
+        return np.mean([l == p for l, p in zip(labels, preds)])
+    def compute_accuracies(labels, preds):
+        results = {}
+        for i in range(hp.classifier_num_targets):
+            results['acc/%d' % i] = accuracy(labels, preds, component=i)
+        results['acc/mean'] = np.mean(list(results.values()))
+        results['acc'] = accuracy(labels, preds)
+        return results
 
-    for i in range(hp.classifier_num_targets):
-        metrics['acc_' + str(i)] = partial(accuracy, component=i)
-        metrics_type['acc_' + str(i)] = 'cls'
-    metrics['acc'] = accuracy
-    metrics_type['acc'] = 'cls'
+    if 'accuracy' in eval_metrics or 'acc' in eval_metrics:
+        metrics['accuracy'] = compute_accuracies
+        metrics_type['accuracy'] = 'cls'
+
+    def f1_fn(labels, preds, component=None, average='macro'):
+        labels, preds = select_filter_label_pred(labels, preds, component)
+        if not labels:
+            return 1
+        from sklearn.metrics import f1_score
+        try:
+            return f1_score(labels, preds, average=average)
+        except:
+            return 0
+
+    def compute_f1(labels, preds, average='binary', name='f1'):
+        results = {}
+        for i in range(hp.classifier_num_targets):
+            results[name + '/' + str(i)] = f1_fn(labels, preds, component=i, average=average)
+        results[name + '/mean'] = np.mean(list(results.values()))
+        # if hp.classifer_num_targets == 1:
+        #     results[name] = f1_fn(labels, preds, average=average)
+        return results
+
+    if 'macrof1' in eval_metrics:
+        metrics['macrof1'] = partial(compute_f1, average='macro', name='macrof1')
+        metrics_type['macrof1'] = 'cls'
+
+    if 'f1' in eval_metrics:
+        metrics['f1'] = partial(compute_f1, average='binary', name='f1')
+        metrics_type['f1'] = 'cls'
+
+    def mse(labels, preds, component=None):
+        labels, preds = select_filter_label_pred(labels, preds, component)
+        if not labels:
+            return 1
+        return {'mse': ((np.asarray(labels) - np.asarray(preds)) ** 2).mean(),
+                'mae': (np.abs(np.asarray(labels) - np.asarray(preds))).mean()}
+    def compute_mse(labels, preds):
+        mse_results = {}
+        mae_results = {}
+        for i in range(hp.classifier_num_targets):
+            r = mse(labels, preds, component=i)
+            mse_results['mse/%d' % i] = r['mse']
+            mae_results['mae/%d' % i] = r['mae']
+        results = {}
+        results.update(mse_results)
+        results.update(mae_results)
+        results['mse/mean'] = np.mean(list(mse_results.values()))
+        results['mae/mean'] = np.mean(list(mae_results.values()))
+        return results
+
+    if 'mse' in eval_metrics:
+        metrics['mse'] = compute_mse
+        metrics_type['mse'] = 'rgs'
+
+def compute_metrics(labels, preds, prefix, subset):
+    results = {}
+    for key, fn in metrics.items():
+        if (prefix == 'classifier') != (metrics_type.get(key, 's2s') in ['cls', 'rgs']):
+            continue
+        if (metrics_type.get(key, 's2s') == 'sum') != (subset.endswith('-sum')):
+            continue
+        try:
+            r = fn(labels, preds)
+            if not isinstance(r, dict):
+                r = {key: r}
+            for k, v in r.items():
+                if type(v).__module__ == 'numpy':
+                    v = v.item()
+                m_key = prefix + '_' + k if prefix else key
+                m_key = subset + '/' + m_key if subset else m_key
+                logging.info("%s: %.4f" % (m_key, v))
+                results[m_key] = v
+        except:
+            tb.print_exc()
+    return results
 
 def compute_qa_metrics(sample_outputs, hp):
     def compute_aos(label, pred):
@@ -135,7 +228,8 @@ def compute_qa_metrics(sample_outputs, hp):
     return result
 
 def infer_batches(model, batches, eval_path, hp, device='cpu', processor=None, write_output=True):
-    os.makedirs(eval_path, exist_ok=True)
+    if write_output:
+        os.makedirs(eval_path, exist_ok=True)
     model.eval()
     if hasattr(model, 'module'):
         eval_model = model.module
@@ -176,7 +270,7 @@ def infer_batches(model, batches, eval_path, hp, device='cpu', processor=None, w
                 if processor and batch['type'] == 's2s':
                     if hp.ctc_weight > 0:
                         sample_output['ctc_logit'] = outputs['logits'][j]
-                        pred = tokenizer.decode(outputs['ctc_logit'][j].argmax(axis=-1))
+                        pred = tokenizer.decode(sample_output['ctc_logit'].argmax(axis=-1))
                         sample_output['ctc_pred'] = pred
                     if 'decoder_outputs' in outputs:
                         sample_output['decoder_pred'] = decoder_tokenizer.decode(
@@ -237,14 +331,26 @@ def infer_batches(model, batches, eval_path, hp, device='cpu', processor=None, w
                         else:
                             sample_output['classifier_logit'] = outputs['classifier_outputs']['logits'][:, j]
                             sample_output['classifier_pred'] = sample_output['classifier_logit'].argmax(axis=-1)
+                            sample_output['classifier_length'] = outputs['classifier_outputs']['lengths'][j]
+                            if 'prompt_lengths' in outputs['classifier_outputs']:
+                                sample_output['prompt_length'] = outputs['classifier_outputs']['prompt_lengths'][j]
+                            if 'attentions' in outputs['classifier_outputs']:
+                                sample_output['attention'] = \
+                                    outputs['classifier_outputs']['attentions'][j][:, :, :sample_output['classifier_length'], :sample_output['classifier_length']]
                     else:
                         sample_output['classifier_pred'] = outputs['classifier_outputs'][j]
+                if batch['type'] == 'rgs':
+                    sample_output['classifier_pred'] = outputs['classifier_outputs']['logits'][:, j]
+                    if 'labels' in batch:
+                        has_cls_label = True
+                        sample_output['classifier_label'] = batch['labels'][j]
+                        sample_output['classifier_loss'] = losses['classifier_losses'][:, j]
 
                 if batch['type'] == 's2s':
                     if hp.ctc_weight > 0 and 'labels' in batch:
                         has_ctc_label = True
                         label = batch['labels'][j]
-                        label[label == -100] = decoder_tokenizer.pad_token_id
+                        label[label == -100] = tokenizer.pad_token_id
                         sample_output['ctc_label'] = tokenizer.decode(label, group_tokens=False)
                     if 'decoder_labels' in batch:
                         has_dec_label = True
@@ -253,6 +359,7 @@ def infer_batches(model, batches, eval_path, hp, device='cpu', processor=None, w
                         label[label == -100] = decoder_tokenizer.pad_token_id
                         sample_output['decoder_label'] = decoder_tokenizer.decode(
                             label, skip_special_tokens=True)
+
                 if batch['type'] == 'cls' and 'labels' in batch:
                     has_cls_label = True
                     if 'classifier_losses' in losses:
@@ -329,18 +436,7 @@ def infer_batches(model, batches, eval_path, hp, device='cpu', processor=None, w
 
             for prefix, labels, preds in targets:
                 if labels and preds:
-                    for key, fn in metrics.items():
-                        if (prefix == 'classifier') != (metrics_type.get(key, 's2s') == 'cls'):
-                            continue
-                        if (metrics_type.get(key, 's2s') == 'sum') != (subset.endswith('-sum')):
-                            continue
-
-                        r = fn(labels, preds)
-                        m_key = prefix + '_' + key if prefix else key
-                        m_key = subset + '/' + m_key if subset else m_key
-
-                        logging.info("%s: %.4f" % (m_key, r))
-                        return_metrics[m_key] = r
+                    return_metrics.update(compute_metrics(labels, preds, prefix, subset))
     # if hp.use_language_adversarial:
     #     return_metrics['lang_adversarial_loss'] = np.mean(get_col(infer_outputs, 'lang_adversarial_loss')).item()
     #     return_metrics['lang_adversarial_acc'] = metrics['acc'](
@@ -428,6 +524,9 @@ def main(args):
         logging.info("Restore from" + model_path + ", step %s" % str(global_step))
         out_path = os.path.join(logdir, 'eval_%d_%s' % (global_step, time_id))
         batches = feeder_eval.fetch_data()
+        if args.downsample_eval_data != -1:
+            hp.max_eval_samples = args.downsample_eval_data
+            batches = pick_eval_samples(batches, hp)
         metrics = infer_batches(m, batches, out_path, hp, device, processor)
         all_metrics[global_step if global_step is not None else model_path] = metrics
         json.dump(metrics, open(os.path.join(out_path, 'metrics.json'), 'w'), indent=2)
@@ -444,6 +543,7 @@ if __name__ == '__main__':
                         help="Directory or path to restore model from")
     parser.add_argument('--output-path', help="Directory or path to save results")
     parser.add_argument('--data-dir', help="Directory with data and metadata")
+    parser.add_argument('--category_vocab_path', type=str, default=None, help="Path to categories.json")
     parser.add_argument('--vocab-path', type=str, default=None, help="Path to vocab.json")
     parser.add_argument('--src_lang', type=str, default='',
                         help="Source languages")
@@ -456,6 +556,7 @@ if __name__ == '__main__':
     parser.add_argument('--hparams', default='', help='Alternative hparams')
     parser.add_argument('--exclude_steps', default='', help='Steps to exclude')
     parser.add_argument('--include_steps', default='', help='Steps to include; overriding other options')
+    parser.add_argument('--downsample_eval_data', type=int, default=-1)
     parser.add_argument('--tb_prefix', default=None)
 
     args, unparsed = parser.parse_known_args()

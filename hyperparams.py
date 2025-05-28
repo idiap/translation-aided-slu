@@ -28,6 +28,7 @@ hparams = HParams(
     use_attention_mask=True,
 
     pad_token_id=0,
+    sos_token_id=0,
 
     reg_weight=5e-3,
     max_grad_norm=1.0,
@@ -41,6 +42,7 @@ hparams = HParams(
     mask_time_prob=0.1,
 
     warmup_steps=20000,
+    lr_step_shift=0,
     plateau_steps=0,
     reset_period=0,
     reset_times=1,
@@ -60,6 +62,7 @@ hparams = HParams(
     asr_keep_feature_encoder_only=False,
     remove_top_layers=12,
     ctc_weight=0.,
+    ctc_tokenizer_name='',
     freeze_feature_encoder=True,
 
     freeze_module='asr_model',
@@ -72,6 +75,7 @@ hparams = HParams(
     decoder_name='facebook/mbart-large-50-many-to-many-mmt',
     decoder_stack_encoder=True,
     decoder_remove_decoder=False,
+    decoder_remove_bottom=0,
     decoder_model_name='',
     decoder_weight=1.0,
     decoder_dropout=0.1,
@@ -92,6 +96,11 @@ hparams = HParams(
     classifier_hidden_size=768,
     classifier_keep_layer_from=0,
     classifier_keep_layer_to=13,
+    classifier_with_prompt=False,
+    classifier_ignore_inputs=False,
+    classifier_max_prompt_length=280,
+    classifier_return_attention=False,
+    classifier_soft_prompt=0,
 
     use_infergen=False,
     infergen_type='mbart',
@@ -110,6 +119,8 @@ hparams = HParams(
     adaptor_use_layernorm=False,
     adaptor_use_glu=True,
     adaptor_output_dim=1024,
+    adaptor_use_residual=False,
+    adaptor_layer_mixer=False,
 
     upper_only=False,
     filter_by_charset=False,
@@ -129,8 +140,11 @@ hparams = HParams(
     qa_ignore_non_segment=True,
     qa_segment_cls_weight=1.0,
 
+    use_grad_checkpoint=False,
+
     eval_num_beams=5,
     eval_length_penalty=1.0,
-    eval_metrics=['bleu', 'wer', 'cer', 'rouge'],
+    eval_metrics="bleu:wer:cer:rouge:accuracy",
     eval_filter_samples=False,
 )
+

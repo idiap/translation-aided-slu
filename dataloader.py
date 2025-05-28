@@ -5,7 +5,6 @@
 #
 # SPDX-License-Identifier: MIT
 #
-
 import copy
 import io
 import logging
@@ -33,9 +32,7 @@ np.random.seed(0)
 class ProtoFeeder(threading.Thread):
     def __init__(self, processor, hparams, rank=0, world_size=1, seed=None):
         super().__init__()
-        self._tokenizer = processor['tokenizer']
-        self._extractor = processor['extractor']
-        self._decoder_tokenizer = processor['decoder_tokenizer']
+        self._processors = processor
 
         self.queue = queue.Queue(maxsize=128)
         self.rand = np.random.RandomState(seed if seed is not None else rank)
@@ -62,13 +59,17 @@ class ProtoFeeder(threading.Thread):
         return self.queue.get()
 
 
+cls_formats = ['nltLa', 'nltPLa', 'nlP_La']
+rgs_formats = ['nltPRa', 'nlP_Ra']
+
 class Feeder(ProtoFeeder):
-    def __init__(self, datadir, processor, metadata_file_path, hparams,
+    def __init__(self, datadir, processor, metadata_file_path, hparams, name, category_file_path,
                  rank=0, world_size=1, shuffle=True, single=False, filter_samples=True,
                  source_lang=None, target_lang=None, seed=None, max_epoch=0):
         super(Feeder, self).__init__(processor=processor, hparams=hparams, rank=rank, world_size=world_size, seed=seed)
         self._offset = 0
         self._epoch = 0
+        self._name = name
         self.global_step = -1
         self.proto = get_input_proto(hparams)
 
@@ -80,13 +81,23 @@ class Feeder(ProtoFeeder):
         self._n_skip = 0
         self._max_epoch = max_epoch
         self.finished = False
+        self._print_examples = True
+        self._metadata_file_path = metadata_file_path
 
-        if hparams.data_format == 'nltLa':
+        if hparams.data_format in cls_formats:
             if hparams.use_infergen and hparams.infergen_mode == 'cls':
                 self._cls_vocab = hparams.classifier_num_targets * \
-                                  [json.load(open(os.path.join(datadir, 'categories_flat.json'), 'r'))]
+                                  [json.load(open(os.path.join(datadir, category_file_path), 'r'))]
             else:
-                self._cls_vocab = json.load(open(os.path.join(datadir, 'categories.json'), 'r'))
+                self._cls_vocab = json.load(open(os.path.join(datadir, category_file_path), 'r'))
+            if hparams.classifier_num_targets == 1 and isinstance(self._cls_vocab, dict):
+                self._cls_vocab = [self._cls_vocab]
+            for dim_i in range(len(self._cls_vocab)):
+                if isinstance(self._cls_vocab[dim_i], int):
+                    self._cls_vocab[dim_i] = list(range(self._cls_vocab[dim_i]))
+                if isinstance(self._cls_vocab[dim_i], list):
+                    self._cls_vocab[dim_i] = {str(x): i for i, x in enumerate(self._cls_vocab[dim_i])}
+            self._processors['cls_vocab'] = self._cls_vocab
         else:
             self._cls_vocab = None
 
@@ -117,19 +128,31 @@ class Feeder(ProtoFeeder):
                               <= self._hparams.input_length_final_upper_bound]
             logging.info("%d samples after filtering length" % len(self._metadata))
 
-        if self._hparams.filter_by_charset:
+        if filter_samples and self._hparams.filter_by_charset:
             self._metadata = [x for x in self._metadata if x['tl'] in ['u', 'tag'] or
                               not any([c not in charset[x['tl']] for c in x['t']])]
             logging.info("%d samples after filtering charset" % len(self._metadata))
 
-        if self._hparams.target_length_lower_bound > 0 and self._hparams.data_format not in ['nltLa', 'DlStLa']:
+        if filter_samples and (self._hparams.target_length_lower_bound > 0 and
+                self._hparams.data_format not in cls_formats + ['DlStLa']):
             self._metadata = [x for x in self._metadata if len(x['t']) > self._hparams.target_length_lower_bound]
             logging.info("%d samples after filtering target length" % len(self._metadata))
 
-        if hparams.data_format == 'nltLa':
+        if hparams.data_format in cls_formats:
             self._metadata = [x for x in self._metadata if all(
-                x['t'].split(',')[i] in self._cls_vocab[i] for i in range(len(self._cls_vocab)))]
+                x['t'][i] in self._cls_vocab[i] or str(x['t'][i]) == '-100'
+                for i in range(len(self._cls_vocab)))]
             logging.info("%d samples after filtering categories" % len(self._metadata))
+
+        if (filter_samples and hparams.classifier_max_prompt_length > 0 and 'P' in self._metadata[0]
+                and hparams.data_format in ['nltPLa', 'nlP_La']):
+            positions = [i for i in range(len(self._metadata))
+                         if len(self._metadata[i]['P']) > hparams.classifier_max_prompt_length]
+            if positions:
+                logging.info("Truncated %d prompts, lengths: %s" % (
+                    len(positions), str([len(self._metadata[i]['P']) for i in positions])))
+                for i in positions:
+                    self._metadata[i]['P'] = self._metadata[i]['P'][:hparams.classifier_max_prompt_length]
 
         self.lang_pairs = set([(x['sl'], x['tl']) for x in self._metadata])
 
@@ -171,13 +194,24 @@ class Feeder(ProtoFeeder):
         tic = time.time()
         examples = self.get_examples(bucket_size)
         examples.sort(key=lambda x: len(x['input']))
+        if self._print_examples:
+            logging.info("### Examples from feeder %s (%s) ###" % (self._metadata_file_path, self._hparams.data_format))
+            for i in range(3):
+                logging.info("### Example %d" % i)
+                for key in examples[i]:
+                    desc = str(examples[i][key])
+                    if isinstance(examples[i][key], np.ndarray):
+                        desc = desc.replace('\n', '')
+                        desc = str(examples[i][key].shape) + ' ' + desc
+                    logging.info("%s: %s" % (key, desc))
+            self._print_examples = False
+
         batches = _pack_into_batches(examples, self._batch_size, self._batch_frame_limit, self._batch_quad_frame_limit)
         if self._shuffle:
             self.rand.shuffle(batches)
 
         for i, batch in enumerate(batches):
-            batch = _prepare_batch(batch, tokenizer=self._tokenizer, extractor=self._extractor, hparams=self._hparams,
-                                   decoder_tokenizer=self._decoder_tokenizer)
+            batch = _prepare_batch(batch, processors=self._processors, hparams=self._hparams)
             batches[i] = batch
         logging.info("Packed %d batches with %d samples in %.2f sec from %s" %
                      (len(batches), len(examples), time.time() - tic, self._datadir))
@@ -206,7 +240,7 @@ class Feeder(ProtoFeeder):
                 self._n_skip += 1
                 continue
             try:
-                return extract_meta(meta, self._datadir, self._hparams, self._cls_vocab)
+                return extract_meta(meta, self._datadir, self._name, self._hparams, self._cls_vocab)
             except:
                 tb.print_exc()
             if self.finished:
@@ -226,6 +260,8 @@ class Feeder(ProtoFeeder):
         while True:
             example = self._get_next_example()
             examples.append(example)
+            # if len(examples) > 3000:
+            #     break
             if self._epoch == 1:
                 self._epoch = 0
                 break
@@ -247,6 +283,9 @@ class Feeder(ProtoFeeder):
         all_batches = []
         for sl, tl in self.lang_pairs:
             sel_examples = [x for x in examples if x['src_lang'] == sl and x['tgt_lang'] == tl]
+            if not sel_examples:
+                logging.warning("No examples for %s-%s" % (sl, tl))
+                continue
             batches = _pack_into_batches(sel_examples, self._batch_size, self._batch_frame_limit, self._batch_quad_frame_limit,
                                          self._single)
             all_batches.extend(batches)
@@ -258,8 +297,7 @@ class Feeder(ProtoFeeder):
         ret = []
         n_samples = 0
         for batch in batches:
-            batch = _prepare_batch(batch, tokenizer=self._tokenizer, extractor=self._extractor, hparams=self._hparams,
-                                   decoder_tokenizer=self._decoder_tokenizer)
+            batch = _prepare_batch(batch, processors=self._processors, hparams=self._hparams)
             n_samples += len(batch['inputs'])
             ret.append(batch)
         self.data = ret
@@ -337,9 +375,7 @@ class MultiFeeder(ProtoFeeder):
     def prepare_all_batches(self):
         batches = []
         for i, f in enumerate(self.feeder):
-            if not hasattr(f, 'data'):
-                f.prepare_all_batches()
-            batches.extend(f.data)
+            batches.extend(f.fetch_data())
         self.data = batches
 
     def fetch_data(self):
@@ -350,10 +386,6 @@ class MultiFeeder(ProtoFeeder):
         data = self.data
         if self._shuffle:
             self.rand.shuffle(data)
-        for batch in data:
-            for name in batch:
-                if name in self.proto:
-                    batch[name] = self.proto[name](batch[name])
         self.eval_batches = data
         return data
 
@@ -382,57 +414,71 @@ def _read_meta(meta_file, hp):
     meta_list = []
     format = hp.data_format
     for line in meta_file:
-        parts = line.strip().split('|')
-        if len(parts) != len(format):
-            parts = line.strip().split('\t')
-        if format == 'nlt':
-            name, length, text = parts
-            item_dict = {'n': name, 'l': int(length), 't': text, 'type': 's2s'}
-        elif format == 'Iltbas':
-            id, length, text, tgt_lang, src_lang, source_text = parts
+        try:
+            parts = json.loads(line.strip())
+            parts = list(parts.values())
+        except ValueError:
+            parts = None
+        if parts is None:
+            if '|' in line:
+                parts = line.strip().split('|')
+            elif '\t' in line:
+                parts = line.strip().split('\t')
+        try:
+            id = parts[0]
             name = id.split('.')[0]
-            # src_lang = src_lang.split('-')[0]
-            item_dict = {'n': name, 'l': int(length), 't': text, 'sl': src_lang, 'tl': tgt_lang, 's': source_text,
-                         'id': id, 'type': 's2s'}
-            if len(id.split('.')) == 4:
+            if len(id.split('.')) >= 3:
                 l, r = int(id.split('.')[-2]), int(id.split('.')[-1])
+            else:
+                l = r = None
+            if format == 'nlt':
+                _, length, text = parts[:3]
+                item_dict = {'n': name, 'l': int(length), 't': text, 's': text, 'id': id, 'type': 's2s', 'sl': 'unk', 'tl': 'unk'}
+            elif format == 'Iltbas':
+                _, length, text, tgt_lang, src_lang, source_text = parts
+                item_dict = {'n': name, 'l': int(length), 't': text, 'sl': src_lang, 'tl': tgt_lang, 's': source_text,
+                             'id': id, 'type': 's2s'}
+            elif format == 'Il__as':
+                _, length, _, _, src_lang, source_text = parts
+                # src_lang = src_lang.split('-')[0]
+                item_dict = {'n': name, 'l': int(length), 't': source_text,
+                             'sl': src_lang, 'tl': src_lang, 's': source_text, 'id': id, 'type': 's2s'}
+            elif format == 'nltLa':
+                _, length, text, label, src_lang = parts
+                if hp.use_infergen and hp.infergen_mode == 'cls':
+                    label = label.split(',')
+                    label = ['%d_%s' % (i, l) for i, l in enumerate(label)]
+                    label = ','.join(label)
+                item_dict = {'n': name, 'l': int(length), 's': text, 't': label, 'sl': src_lang, 'tl': 'u',
+                             'id': id}
+            elif format == 'nltPLa' or format == 'nltPRa':
+                _, length, text, prompt, label, src_lang = parts
+                item_dict = {'n': name, 'l': int(length), 's': text, 't': label, 'sl': src_lang, 'tl': 'u',
+                             'id': id, 'P': prompt}
+            elif format == 'nlP_La' or format == 'nlP_Ra':
+                _, length, text, _, label, src_lang = parts
+                item_dict = {'n': name, 'l': int(length), 's': text, 't': label, 'sl': src_lang, 'tl': 'u',
+                             'id': id, 'P': text}
+            elif format == 'DlStLa':
+                _, length, seg_length, text, label, src_lang = parts
+                item_dict = {'n': id, 'l': int(length), 's': text, 't': label, 'sl': src_lang, 'tl': 'tag',
+                             'S': int(seg_length), 'id': id, 'type': 'cls'}
+            else:
+                raise ValueError('Invalid format for _read_meta: %s' % format)
+            if l is not None:
                 item_dict['start'] = l
                 item_dict['end'] = r
-        elif format == 'Il__as':
-            id, length, _, _, src_lang, source_text = parts
-            name = id.split('.')[0]
-            # src_lang = src_lang.split('-')[0]
-            item_dict = {'n': name, 'l': int(length), 't': source_text,
-                         'sl': src_lang, 'tl': src_lang, 's': source_text, 'id': id, 'type': 's2s'}
-            if len(id.split('.')) == 4:
-                l, r = int(id.split('.')[-2]), int(id.split('.')[-1])
-                item_dict['start'] = l
-                item_dict['end'] = r
-        elif format == 'nltLa':
-            id, length, text, label, src_lang = parts
-            name = id.split('.')[0]
-            if hp.use_infergen and hp.infergen_mode == 'cls':
-                label = label.split(',')
-                label = ['%d_%s' % (i, l) for i, l in enumerate(label)]
-                label = ','.join(label)
-            # if '-' in src_lang:
-            #     item_dict = {'n': name, 'l': int(length), 's': text, 't': label, 'sl': src_lang.split('-')[0],
-            #                  'tl': 'u' + '_' + src_lang, 'type': 'cls'}
-            # else:
-            item_dict = {'n': name, 'l': int(length), 's': text, 't': label, 'sl': src_lang, 'tl': 'u',
-                         'type': 'cls'}
-            if len(id.split('.')) == 4:
-                l, r = int(id.split('.')[-2]), int(id.split('.')[-1])
-                item_dict['start'] = l
-                item_dict['end'] = r
-        elif format == 'DlStLa':
-            # if len(parts) != 6:
-            #     print()
-            id, length, seg_length, text, label, src_lang = parts
-            item_dict = {'n': id, 'l': int(length), 's': text, 't': label, 'sl': src_lang, 'tl': 'tag',
-                         'S': int(seg_length), 'type': 'cls'}
-        else:
-            raise ValueError('Invalid format for _read_meta: %s' % format)
+            if format in cls_formats:
+                item_dict['type'] = 'cls'
+            if format in rgs_formats:
+                item_dict['type'] = 'rgs'
+            if format in cls_formats or format in rgs_formats:
+                if isinstance(item_dict['t'], str):
+                    item_dict['t'] = item_dict['t'].split(',')
+                item_dict['t'] = [str(x) for x in item_dict['t']]
+        except Exception as e:
+            logging.error("Line: ", line)
+            raise e
         meta_list.append(item_dict)
     return meta_list
 
@@ -449,18 +495,22 @@ def _pack_into_batches(examples, batch_size, batch_frame_limit, batch_quad_frame
     return batches
 
 
-def _prepare_batch(batch, tokenizer: Wav2Vec2CTCTokenizer, extractor: Wav2Vec2FeatureExtractor,
-                   hparams, decoder_tokenizer=None):
+def _prepare_batch(batch, processors, hparams):
     input_lengths = np.asarray([len(x['input']) for x in batch], dtype=np.int32)
     results = {'input_lengths': input_lengths,
                'names': [x['name'] for x in batch],
                'src_lang': [language_id[x['src_lang']] for x in batch],
                'tgt_lang': [language_id[x['tgt_lang']] for x in batch]}
-    if hparams.input_type == 'audio':
-        inputs = extractor([x['input'] for x in batch], padding=True, pad_to_multiple_of=8, sampling_rate=hparams.sr)
-        results['inputs'] = np.asarray(inputs.data['input_values'])
+    if hparams.input_type == 'audio' and processors.get('extractor'):
+        extractor = processors['extractor']
+        inputs = extractor([x['input'] for x in batch],
+                           padding=True,
+                           #padding='max_length' if type(extractor).__name__ == 'WhisperFeatureExtractor' else True,
+                           pad_to_multiple_of=8, sampling_rate=hparams.sr,
+                           return_attention_mask=True, do_normalize=True)
+        results['inputs'] = np.asarray(inputs.data.get('input_values', inputs.data.get('input_features', None)))
         if 'attention_mask' in inputs.data:
-            results['input_masks'] = np.asarray(inputs.data['attention_mask'])
+            results['input_masks'] = np.asarray(inputs.data['attention_mask'])[:, :results['inputs'].shape[-1]]
     else:
         max_length = max([len(x['input']) for x in batch])
         inputs = np.zeros((len(batch), max_length) + batch[0]['input'].shape[1:], dtype=np.float32)
@@ -473,6 +523,7 @@ def _prepare_batch(batch, tokenizer: Wav2Vec2CTCTokenizer, extractor: Wav2Vec2Fe
 
     if 'label' in batch[0]:
         if batch[0].get('type', '') == 's2s':
+            tokenizer = processors['tokenizer']
             labels = tokenizer([x['label'].upper() if hparams.upper_only else x['label'] for x in batch], padding=True)
             results['labels'] = np.asarray(labels.data['input_ids'])
             results['label_lengths'] = np.asarray([len(x['label']) for x in batch], dtype=np.int32)
@@ -482,6 +533,7 @@ def _prepare_batch(batch, tokenizer: Wav2Vec2CTCTokenizer, extractor: Wav2Vec2Fe
                                          -100, results['labels'])
 
             if hparams.use_decoder:
+                decoder_tokenizer = processors['decoder_tokenizer']
                 labels = decoder_tokenizer([x['label'] for x in batch], padding=True)
                 results['decoder_labels'] = np.asarray(labels.data['input_ids'])
                 results['decoder_label_masks'] = np.asarray(labels.data['attention_mask'])
@@ -496,9 +548,30 @@ def _prepare_batch(batch, tokenizer: Wav2Vec2CTCTokenizer, extractor: Wav2Vec2Fe
             max_length = max(max(results['label_lengths']), 2) # Avoid empty tensor
             labels = np.zeros((len(batch), max_length), dtype=np.int32)
             for i, x in enumerate(batch):
+                if hparams.data_format in cls_formats:
+                    x['label'] = [processors['cls_vocab'][i][x] if x != '-100' else '-100' for i, x in enumerate(x['label'])]
                 labels[i, :len(x['label'])] = x['label']
                 labels[i, len(x['label']):] = -100
             results['labels'] = labels
+        elif batch[0].get('type', '') == 'rgs':
+            results['label_lengths'] = np.asarray([len(x['label']) for x in batch], dtype=np.int32)
+            max_length = max(max(results['label_lengths']), 2) # Avoid empty tensor
+            labels = np.zeros((len(batch), max_length), dtype=np.float32)
+            for i, x in enumerate(batch):
+                if hparams.data_format in rgs_formats:
+                    x['label'] = [float(x) for i, x in enumerate(x['label'])]
+                labels[i, :len(x['label'])] = x['label']
+                labels[i, len(x['label']):] = -100
+            results['labels'] = labels
+
+    if 'input_prompt' in batch[0]:
+        classifier_tokenizer = processors['classifier_tokenizer']
+        prompts = classifier_tokenizer([x['input_prompt'] for x in batch], padding=True)
+        prompt_ids = np.asarray(prompts.data['input_ids'])
+        prompt_ids[prompt_ids == classifier_tokenizer.pad_token_id] = -100
+        results['input_prompts'] = prompt_ids
+        results['input_prompt_texts'] = [x['input_prompt'] for x in batch]
+
     if 'dataset_name' in batch[0]:
         results['dataset_names'] = [x['dataset_name'] for x in batch]
     if 'input_segment' in batch[0]:
@@ -524,6 +597,8 @@ def get_audiofile_spec(datadir, sub_dir, name):
                 if len(name.split('_')) == 3:
                     sub_sub_dir = name.split('_')[1]
                     return get_audiofile_spec(os.path.join(datadir, sub_dir), sub_sub_dir, name)
+                elif os.path.exists(os.path.join(datadir, name)):
+                    return open(os.path.join(datadir, name), 'rb')
                 else:
                     raise ValueError('File not found: %s, %s, %s' % (datadir, sub_dir, name))
 
@@ -538,15 +613,16 @@ def get_audiofile(datadir, sub_dir, name):
 def read_file(f, start=0, stop=None, input_type='audio'):
     if input_type == 'audio':
         return sd.read(f, start=start, stop=stop)[0]
+        # return sd.read(f, start=start, stop=stop, always_2d=True)[0].mean(-1)
     elif input_type == 'pickle':
         return pickle.load(f)
     else:
         raise ValueError('Unknown input type: %s' % input_type)
 
 
-def extract_meta(meta, datadir, hparams, cls_vocab=None, cached=False):
+def extract_meta(meta, datadir, dataset_name, hparams, cls_vocab=None, cached=False):
     name = meta['n']
-    results = {'name': meta.get('id', name), 'dataset_name': os.path.split(datadir)[-1]}
+    results = {'name': meta.get('id', name), 'dataset_name': dataset_name}
 
     if hparams.data_format == 'DlStLa':
         names = name.split(',')
@@ -556,31 +632,39 @@ def extract_meta(meta, datadir, hparams, cls_vocab=None, cached=False):
         input_data = np.concatenate(input_data)
         results['input_segment'] = meta['S']
     else:
-        audio_file = get_audiofile(datadir, name.split('_')[0], name)
-        if 'start' not in meta:
-            input_data = read_file(audio_file, input_type=hparams.input_type)
-        else:
-            input_data = read_file(audio_file, start=meta['start'], stop=meta['end'], input_type=hparams.input_type)
+        try:
+            audio_file = get_audiofile(datadir, name.split('_')[0], name)
+            if 'start' not in meta:
+                input_data = read_file(audio_file, input_type=hparams.input_type)
+            else:
+                input_data = read_file(audio_file, start=meta['start'], stop=meta['end'], input_type=hparams.input_type)
+            # if len(input_data) > 16000 * 40:
+            #     input_data = input_data[:1600]
+        except:
+            print(name)
+            raise ValueError('File not found: %s, %s' % (datadir, name))
     results['input'] = input_data
-    if hparams.data_format in ['nltLa']:
-        results['label'] = [cls_vocab[i][x] for i, x in enumerate(meta['t'].split(','))]
-        results['type'] = 'cls'
+    results['type'] = meta['type']
+    if hparams.data_format in cls_formats:
+        results['label'] = meta['t'] if isinstance(meta['t'], list) else meta['t'].split(',')
+    elif hparams.data_format in rgs_formats:
+        results['label'] = meta['t'] if isinstance(meta['t'], list) else meta['t'].split(',')
     elif hparams.data_format in ['DlStLa']:
         results['label'] = json.loads(meta['t']) # [N_spans * 2]
         if len(results['label']) == 0:
             results['label'] = [0, 0]
-        results['type'] = 'cls'
     else:
         results['label'] = meta['t']
-        results['type'] = 's2s'
     results['length'] = meta['l']
     if meta['l'] != len(results['input']):
-        assert np.abs(meta['l'] / len(results['input']) - 1) < 0.05 # It may happen due to rounding errors, but not too large
+        # assert np.abs(meta['l'] / len(results['input']) - 1) < 0.05 # It may happen due to rounding errors, but not too large
         meta['l'] = len(results['input'])
     if 'sl' in meta:
         results['src_lang'] = meta['sl']
         results['tgt_lang'] = meta['tl']
         results['source_text'] = meta['s']
+    if 'P' in meta:
+        results['input_prompt'] = meta['P']
     return results
 
 
@@ -588,7 +672,7 @@ def get_input_proto(config):
     keys = {'inputs': torch.FloatTensor, 'input_lengths': torch.LongTensor,
             'labels': torch.LongTensor, 'label_lengths': torch.LongTensor,
             'src_lang': torch.LongTensor, 'tgt_lang': torch.LongTensor,
-            'names': list, 'dataset_names': list, 'type': str}
+            'names': list, 'dataset_names': list, 'type': str, 'ids': list}
     if config.use_attention_mask:
         keys['input_masks'] = torch.LongTensor
         keys['label_masks'] = torch.LongTensor
@@ -598,6 +682,11 @@ def get_input_proto(config):
         keys['decoder_label_masks'] = torch.LongTensor
     if config.data_format == 'DlStLa':
         keys['input_segments'] = torch.LongTensor
+    if config.data_format == 'nltPRa' or config.data_format == 'nlP_Ra':
+        keys['labels'] = torch.FloatTensor
+    if config.use_classifier and config.classifier_with_prompt:
+        keys['input_prompts'] = torch.LongTensor
+        keys['input_prompt_texts'] = list
     return keys
 
 def parse_meta_list(meta, data_dir, default_file):
@@ -623,12 +712,23 @@ def get_feeder(args, hp, rank, world_size, get_train=True, get_eval=True, shuffl
     tgt_lang = args.tgt_lang.split(':') if args.tgt_lang else None
 
     if args.datasets:
-        datasets = args.datasets.split(':')
-        data_dir = [os.path.join(args.data_dir, d) for d in datasets]
+        dataset_names = args.datasets.split(':')
+        data_dir = [os.path.join(args.data_dir, d.split('@')[0]) for d in dataset_names]
     else:
         data_dir = [args.data_dir]
+        dataset_names = [os.path.split(args.data_dir)[-1]]
 
     vocab_path = args.vocab_path if args.vocab_path else os.path.join(args.data_dir, 'vocab.json')
+    if args.category_vocab_path:
+        cat_vocab_path = args.category_vocab_path.split(':')
+    elif hp.use_infergen:
+        cat_vocab_path = ['categories_flat.json']
+    else:
+        cat_vocab_path = ['categories.json']
+    if len(cat_vocab_path) == 1:
+        cat_vocab_path = cat_vocab_path * len(data_dir)
+    assert len(cat_vocab_path) == len(data_dir)
+    cat_vocab_path = [os.path.join(d, p) if not os.path.exists(p) else p for d, p in zip(data_dir, cat_vocab_path)]
     hparams = [copy.copy(hp) for _ in data_dir]
     if ':' in hp.data_format:
         data_format = hp.data_format.split(':')
@@ -646,7 +746,9 @@ def get_feeder(args, hp, rank, world_size, get_train=True, get_eval=True, shuffl
             if train_meta[i] is None:
                 logging.info('No training data for %s' % d)
                 continue
-            feeder = Feeder(d, processor, train_meta[i], hparams=hparams[i],
+            logging.info("Building train data feeder from %s, format: %s" % (train_meta[i], hparams[i].data_format))
+            feeder = Feeder(d, processor, train_meta[i], name=dataset_names[i],
+                            category_file_path=cat_vocab_path[i], hparams=hparams[i],
                             rank=rank, world_size=world_size, shuffle=hp.shuffle_training_data,
                             source_lang=src_lang, target_lang=tgt_lang, seed=rank * len(data_dir) + i,
                             max_epoch=args.max_epoch)
@@ -678,7 +780,10 @@ def get_feeder(args, hp, rank, world_size, get_train=True, get_eval=True, shuffl
             if eval_meta[i] is None:
                 logging.info('No eval data for %s' % d)
                 continue
-            feeder_eval = Feeder(d, processor, eval_meta[i], hparams=hparams[i], filter_samples=hp.eval_filter_samples,
+            logging.info("Building eval data feeder from %s, format: %s" % (eval_meta[i], hparams[i].data_format))
+            feeder_eval = Feeder(d, processor, eval_meta[i], name=dataset_names[i],
+                                 category_file_path=cat_vocab_path[i], hparams=hparams[i],
+                                 filter_samples=hp.eval_filter_samples,
                                  source_lang=src_lang, target_lang=tgt_lang,
                                  shuffle=shuffle_eval, seed=rank * len(data_dir) + i)
             if reduce_eval_batch:

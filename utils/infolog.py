@@ -5,7 +5,6 @@
 #
 # SPDX-License-Identifier: MIT
 #
-
 import os
 import torch
 import logging
@@ -59,6 +58,31 @@ class StreamToLogger(object):
     def flush(self):
         pass
 
+def plot_attn(attn, path, enc_length=None, dec_length=None):
+    # attn: [(heads, dec, enc)]
+    results = None
+    best_score = 0
+    info = ''
+    with lock:
+        for k, layer_attn in enumerate(attn):
+            if enc_length:
+                layer_attn = layer_attn[:, :, :enc_length]
+            if dec_length:
+                layer_attn = layer_attn[:, :dec_length]
+            for head in range(layer_attn.shape[0]):
+                score = 0
+                for dec_step in range(layer_attn.shape[1]):
+                    score += layer_attn[head, dec_step].max()
+                if score > best_score:
+                    results = layer_attn[head]
+                    best_score = score
+                    info = "Layer %d, Head %d" % (k, head)
+        plt.figure(figsize=(14, 7))
+        plt.pcolor(results)
+        plt.title(info)
+        plt.savefig(path)
+        plt.close()
+
 class ValueWindow():
     def __init__(self, window_size=100):
         self._window_size = window_size
@@ -81,3 +105,35 @@ class ValueWindow():
 
     def reset(self):
         self._values = []
+
+class LookupWindow():
+    def __init__(self, name, reduction='avg'):
+        self.name = name
+        self.values = defaultdict(list)
+        self.reduction = reduction
+
+    def update(self, keys, values):
+        for i in range(len(keys)):
+            if values[i] is None:
+                continue
+            self.values[keys[i]].append(values[i])
+
+    def clear(self):
+        self.values = defaultdict(list)
+
+    def summary(self):
+        results = []
+        if self.reduction == 'total':
+            total = sum([sum(v) for v in self.values.values()])
+        for key in self.values:
+            v = sum(self.values[key])
+            if self.reduction == 'sum':
+                v = v
+            elif self.reduction == 'total':
+                v = v / total
+            else:
+                v = v / len(self.values[key])
+            if key != '':
+                key = '/' + key
+            results.append((self.name + key, v))
+        return results

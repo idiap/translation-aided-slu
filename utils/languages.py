@@ -5,7 +5,6 @@
 #
 # SPDX-License-Identifier: MIT
 #
-
 language_id = {
     'u': 0,
     'de': 1,
@@ -21,6 +20,7 @@ language_id = {
     'en-GB': 11,
     'en-AU': 12,
     'fr-FR': 13,
+    'unk': 14,
 }
 
 id_to_lang = {v: k for k, v in language_id.items()}
@@ -29,3 +29,4 @@ charset = {}
 charset['en'] = 'ABCDEFGHIJKLMNOPQRSTUVWYXZabcdefghijklmnopqrstuvwxyz0123456789!\',-.:;? ()%/°'
 charset['fr'] = charset['en'] + 'àâæçéèêëîïôœùûüÿŸÜÛÙŒÔÏÎËÊÈÉÇÆÂÀº'
 charset['en-sum'] = charset['en'] + '&'
+charset['es'] = charset['en'] + '¡¿ñáéíóúÁÉÍÓÚÑªºüÜ'
